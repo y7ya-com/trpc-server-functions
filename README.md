@@ -1,8 +1,32 @@
 # tRPC Server Functions
 
-`trpc-server-functions` brings co-located server functions to `tRPC` + Vite apps. Define a server function anywhere in your frontend, and the matching `tRPC` procedures are generated automatically for your backend router.
+`trpc-server-functions` brings co-located server functions to `tRPC` + Vite apps.
 
-## Usage
+Define a server function anywhere in your frontend, and generate matching `tRPC` procedures for your backend router.
+
+## Expected Structure
+
+This package is designed for a split setup: a Vite client app and a separate server app.
+
+```text
+your-app/
+  client/
+    src/
+      App.tsx
+      main.tsx
+    vite.config.ts
+  server/
+    src/
+      db.ts
+      trpc.ts
+      router.ts
+      generated/
+        trpc-server-functions.ts
+```
+
+The generated file is written by the client-side Vite plugin or by the CLI on first setup.
+
+## 1-File Counter Example
 
 ```tsx
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -46,7 +70,11 @@ export function Counter() {
 }
 ```
 
-The client build strips the handlers and keeps only typed RPC proxies. The server imports a generated module that turns these exports into real tRPC procedures.
+At build time:
+
+- the client keeps typed RPC proxies
+- the real handlers are removed from the browser bundle
+- a generated server module turns these exports into normal `tRPC` procedures
 
 ## Setup
 
@@ -56,7 +84,7 @@ Install the package:
 npm install trpc-server-functions
 ```
 
-Add the Vite plugin in the client:
+### 1. Add the Vite plugin
 
 ```ts
 import path from "node:path";
@@ -79,7 +107,17 @@ export default defineConfig({
 });
 ```
 
-Use the generated module in the server router:
+### 2. Generate the server module once
+
+```bash
+trpc-server-functions generate \
+  --root ./client \
+  --generated-module-path ../server/src/generated/trpc-server-functions.ts \
+  --procedure-import-path ../server/src/trpc.ts \
+  --procedure-export-name publicProcedure
+```
+
+### 3. Use the generated module in the server router
 
 ```ts
 import { trpcServerFunctions } from "./generated/trpc-server-functions";
@@ -91,7 +129,7 @@ export const appRouter = router({
 });
 ```
 
-Connect the client transport:
+### 4. Connect the client transport
 
 ```ts
 import { createTRPCUntypedClient, httpBatchLink } from "@trpc/client";
@@ -107,12 +145,4 @@ const trpcClient = createTRPCUntypedClient({
 setServerFnTransport(createTRPCClientTransport(trpcClient));
 ```
 
-On first setup, generate the server module:
-
-```bash
-trpc-server-functions generate \
-  --root ./client \
-  --generated-module-path ../server/src/generated/trpc-server-functions.ts \
-  --procedure-import-path ../server/src/trpc.ts \
-  --procedure-export-name publicProcedure
-```
+After that, `queryOptions()`, `mutationOptions()`, and `call()` use your existing `tRPC` endpoint.
