@@ -1,0 +1,35 @@
+{
+  "name": "client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc -b",
+    "generate:server-functions": "trpc-server-functions generate --root . --generated-module-path ../server/src/generated/trpc-server-functions.ts --procedure-import-path ../server/src/trpc.ts --procedure-export-name publicProcedure",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.2",
+    "@trpc/client": "^11.7.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "trpc-server-functions": "link:../.."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.4.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.58.0",
+    "vite": "^7.1.8"
+  }
+}

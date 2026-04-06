@@ -1,0 +1,21 @@
+{
+  "name": "server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.12",
+    "@hono/trpc-server": "^0.4.0",
+    "@trpc/server": "^11.7.1",
+    "hono": "^4.9.6",
+    "trpc-server-functions": "link:../.."
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

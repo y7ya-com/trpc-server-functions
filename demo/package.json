@@ -1,0 +1,9 @@
+{
+  "name": "demo",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "dev": "pnpm --filter client generate:server-functions && pnpm -r --parallel --stream dev",
+    "check": "pnpm -r check"
+  }
+}
