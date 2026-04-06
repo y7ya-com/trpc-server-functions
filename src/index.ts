@@ -23,4 +23,5 @@ export type {
   ServerFnQueryOptions,
   ServerFnReferenceEntry,
   ServerFnTransport,
+  TRPCProcedureRecord,
 } from "./runtime/index.js";

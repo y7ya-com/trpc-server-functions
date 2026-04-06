@@ -1,3 +1,5 @@
+import type { AnyProcedure, TRPCRouterRecord } from "@trpc/server";
+
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface CreateServerFnOptions<TInput> {
@@ -97,6 +99,8 @@ export interface ServerFnReferenceEntry extends ServerFnManifestEntry {
 
 export interface ProcedureBuilderLike {
   input?: (schema: any) => ProcedureBuilderLike;
-  query: (resolver: (args: { ctx: any; input: any }) => unknown) => unknown;
-  mutation: (resolver: (args: { ctx: any; input: any }) => unknown) => unknown;
+  query: (resolver: (args: { ctx: any; input: any }) => unknown) => AnyProcedure;
+  mutation: (resolver: (args: { ctx: any; input: any }) => unknown) => AnyProcedure;
 }
+
+export type TRPCProcedureRecord = TRPCRouterRecord;

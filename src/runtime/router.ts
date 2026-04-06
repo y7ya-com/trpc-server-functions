@@ -1,11 +1,15 @@
 import { getInternalServerFnDefinition } from "./createServerFn.js";
-import type { ProcedureBuilderLike, ServerFnReferenceEntry } from "./types.js";
+import type {
+  ProcedureBuilderLike,
+  ServerFnReferenceEntry,
+  TRPCProcedureRecord,
+} from "./types.js";
 
 export function createTRPCProcedureRecord(
   baseProcedure: ProcedureBuilderLike,
   entries: readonly ServerFnReferenceEntry[],
-) {
-  const record: Record<string, unknown> = {};
+): TRPCProcedureRecord {
+  const record: TRPCProcedureRecord = {};
 
   for (const entry of entries) {
     const definition = getInternalServerFnDefinition(entry.reference);
