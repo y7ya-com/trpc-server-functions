@@ -1,5 +1,5 @@
-import { createTRPCProcedureRecord, withServerFnMetadata } from "trpc-server-functions/runtime";
-import type { ServerFnReferenceEntry } from "trpc-server-functions/runtime";
+import { createTRPCProcedureRecord, withServerFnMetadata } from "trpc-server-functions";
+import type { ServerFnReferenceEntry } from "trpc-server-functions";
 import { publicProcedure as __baseProcedure } from "../trpc.ts";
 import { getCount as __serverFn0 } from "../../../client/src/App.tsx";
 import { incrementCount as __serverFn1 } from "../../../client/src/App.tsx";

@@ -8,7 +8,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { db } from "../../server/src/db";
-import { createServerFn } from "trpc-server-functions/runtime";
+import { createServerFn } from "trpc-server-functions";
 
 export const getCount = createServerFn().query(async () => {
   return db.getCount();
@@ -63,7 +63,7 @@ import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-import { trpcServerFunctionsPlugin } from "trpc-server-functions";
+import { trpcServerFunctionsPlugin } from "trpc-server-functions/vite";
 
 export default defineConfig({
   plugins: [
@@ -98,7 +98,7 @@ import { createTRPCUntypedClient, httpBatchLink } from "@trpc/client";
 import {
   createTRPCClientTransport,
   setServerFnTransport,
-} from "trpc-server-functions/runtime";
+} from "trpc-server-functions";
 
 const trpcClient = createTRPCUntypedClient({
   links: [httpBatchLink({ url: "/api/trpc" })],
@@ -107,7 +107,7 @@ const trpcClient = createTRPCUntypedClient({
 setServerFnTransport(createTRPCClientTransport(trpcClient));
 ```
 
-If your server can start before Vite writes the generated file, pre-generate it:
+On first setup, generate the server module:
 
 ```bash
 trpc-server-functions generate \

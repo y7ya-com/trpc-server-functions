@@ -561,10 +561,10 @@ function generateServerFunctionsModule(
 
   return [
     `import { createTRPCProcedureRecord, withServerFnMetadata } from ${JSON.stringify(
-      `${PACKAGE_NAME}/runtime`,
+      PACKAGE_NAME,
     )};`,
     ...(includeTypeAnnotations
-      ? [`import type { ServerFnReferenceEntry } from ${JSON.stringify(`${PACKAGE_NAME}/runtime`)};`]
+      ? [`import type { ServerFnReferenceEntry } from ${JSON.stringify(PACKAGE_NAME)};`]
       : []),
     `import { ${procedureExportName} as __baseProcedure } from ${JSON.stringify(procedureImportPath)};`,
     ...importLines,

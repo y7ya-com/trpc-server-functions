@@ -4,6 +4,11 @@
     "target": "es2023",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "esnext",
+    "baseUrl": ".",
+    "paths": {
+      "trpc-server-functions": ["../../dist/index.d.ts"],
+      "trpc-server-functions/vite": ["../../dist/vite.d.ts"]
+    },
     "types": ["vite/client"],
     "skipLibCheck": true,
 

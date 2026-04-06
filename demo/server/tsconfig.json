@@ -4,6 +4,11 @@
     "lib": ["ES2023"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "baseUrl": ".",
+    "paths": {
+      "trpc-server-functions": ["../../dist/index.d.ts"],
+      "trpc-server-functions/vite": ["../../dist/vite.d.ts"]
+    },
     "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "strict": true,

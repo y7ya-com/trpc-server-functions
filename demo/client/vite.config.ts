@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import react from '@vitejs/plugin-react'
 import { defineConfig, type PluginOption } from 'vite'
 
-import { trpcServerFunctionsPlugin } from 'trpc-server-functions'
+import { trpcServerFunctionsPlugin } from 'trpc-server-functions/vite'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const demoRoot = path.resolve(__dirname, '..')

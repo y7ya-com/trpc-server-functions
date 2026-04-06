@@ -6,7 +6,7 @@ import { createTRPCUntypedClient, httpBatchLink } from '@trpc/client'
 import {
   createTRPCClientTransport,
   setServerFnTransport,
-} from 'trpc-server-functions/runtime'
+} from 'trpc-server-functions'
 import App from './App.tsx'
 
 const queryClient = new QueryClient()

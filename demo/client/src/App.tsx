@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { db } from '../../server/src/db'
-import { createServerFn } from 'trpc-server-functions/runtime'
+import { createServerFn } from 'trpc-server-functions'
 
 export const getCount = createServerFn().query(async () => {
   return db.getCount()
