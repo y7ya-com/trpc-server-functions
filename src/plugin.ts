@@ -38,6 +38,16 @@ export interface GenerateServerFunctionsModuleOptions {
   generatedModulePath: string;
 }
 
+interface DiscoveryGlobs {
+  include: string[];
+  ignore: string[];
+}
+
+interface TopLevelBindingInfo {
+  bindingPath: NodePath<t.Node>;
+  statementPath: NodePath<t.Node>;
+}
+
 interface RawServerFnMatch {
   localName: string;
   callStart: number;
@@ -57,7 +67,12 @@ interface DiscoveredServerFn extends RawServerFnMatch {
 }
 
 const DEFAULT_INCLUDE = ["**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}"];
-const DEFAULT_EXCLUDE = ["**/node_modules/**", "**/dist/**"];
+const DEFAULT_EXCLUDE = [
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/__trpc_server_functions__/**",
+];
+const GENERATED_SERVER_MODULE_DIRNAME = "__trpc_server_functions__";
 const traverse =
   (traverseModule as unknown as { default?: typeof import("@babel/traverse").default })
     .default ??
@@ -65,14 +80,34 @@ const traverse =
 
 function createRouteKey(relativePath: string, exportName: string) {
   const withoutExtension = relativePath.replace(/\.[^./]+$/, "");
-  const safePath = withoutExtension.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  const safeExport = exportName.replace(/[^a-zA-Z0-9]+/g, "_");
-  const hash = createHash("sha1")
+  const hash = createHash("sha256")
     .update(`${withoutExtension}:${exportName}`)
     .digest("hex")
-    .slice(0, 8);
+    .slice(0, 24);
 
-  return `${safePath}__${safeExport}__${hash}`;
+  return `sf_${hash}`;
+}
+
+function toArray<T>(value: T | readonly T[] | undefined) {
+  if (value == null) {
+    return [];
+  }
+
+  return Array.isArray(value) ? [...value] : [value];
+}
+
+function isGlobPattern(value: Pattern): value is string {
+  return typeof value === "string";
+}
+
+function resolveDiscoveryGlobs(include?: Pattern, exclude?: Pattern): DiscoveryGlobs {
+  const includePatterns = toArray(include).filter(isGlobPattern);
+  const excludePatterns = toArray(exclude).filter(isGlobPattern);
+
+  return {
+    include: includePatterns.length > 0 ? includePatterns : DEFAULT_INCLUDE,
+    ignore: [...DEFAULT_EXCLUDE, ...excludePatterns],
+  };
 }
 
 function isCreateServerFnReference(
@@ -516,6 +551,27 @@ function resolveFromRoot(root: string, filePath: string) {
   );
 }
 
+function getGeneratedServerModulesRoot(generatedModulePath: string) {
+  return normalizePath(
+    path.join(path.dirname(generatedModulePath), GENERATED_SERVER_MODULE_DIRNAME),
+  );
+}
+
+function getGeneratedServerModulePath(
+  generatedModulePath: string,
+  originalFilePath: string,
+  root: string,
+) {
+  const relativePath = normalizePath(path.relative(root, originalFilePath)).replace(
+    /\.[^./]+$/,
+    ".ts",
+  );
+
+  return normalizePath(
+    path.join(getGeneratedServerModulesRoot(generatedModulePath), relativePath),
+  );
+}
+
 function toRelativeImportPath(fromFilePath: string, targetFilePath: string) {
   const relativePath = normalizePath(path.relative(path.dirname(fromFilePath), targetFilePath));
 
@@ -524,6 +580,353 @@ function toRelativeImportPath(fromFilePath: string, targetFilePath: string) {
   }
 
   return `./${relativePath}`;
+}
+
+function getTopLevelStatementPath(path: NodePath<t.Node>) {
+  if (path.parentPath?.isImportDeclaration() && path.parentPath.parentPath?.isProgram()) {
+    return path.parentPath as NodePath<t.Node>;
+  }
+
+  let current: NodePath<t.Node> | null = path;
+
+  while (current) {
+    const parent = current.parentPath;
+
+    if (!parent) {
+      return null;
+    }
+
+    if (parent.isProgram()) {
+      return current;
+    }
+
+    if (parent.isExportNamedDeclaration() && parent.parentPath?.isProgram()) {
+      return parent as NodePath<t.Node>;
+    }
+
+    current = parent as NodePath<t.Node>;
+  }
+
+  return null;
+}
+
+function isGeneratedModuleTopLevelBindingPath(path: NodePath<t.Node>) {
+  if (
+    path.isImportSpecifier() ||
+    path.isImportDefaultSpecifier() ||
+    path.isImportNamespaceSpecifier()
+  ) {
+    return path.parentPath.isImportDeclaration() && path.parentPath.parentPath?.isProgram() === true;
+  }
+
+  if (path.isVariableDeclarator()) {
+    const declarationPath = path.parentPath;
+    const containerPath = declarationPath.parentPath;
+
+    return (
+      declarationPath.isVariableDeclaration() &&
+      containerPath != null &&
+      (containerPath.isProgram() ||
+        (containerPath.isExportNamedDeclaration() && containerPath.parentPath?.isProgram() === true))
+    );
+  }
+
+  if (path.isFunctionDeclaration() || path.isClassDeclaration()) {
+    return (
+      path.parentPath?.isProgram() === true ||
+      (path.parentPath?.isExportNamedDeclaration() === true &&
+        path.parentPath.parentPath?.isProgram() === true)
+    );
+  }
+
+  return false;
+}
+
+function collectTopLevelBindings(ast: t.File) {
+  const bindings = new Map<string, TopLevelBindingInfo>();
+
+  const register = (name: string, bindingPath: NodePath<t.Node>) => {
+    const statementPath = getTopLevelStatementPath(bindingPath);
+
+    if (!statementPath || bindings.has(name)) {
+      return;
+    }
+
+    bindings.set(name, {
+      bindingPath,
+      statementPath,
+    });
+  };
+
+  traverse(ast, {
+    ImportSpecifier(path: NodePath<t.ImportSpecifier>) {
+      register(path.node.local.name, path as NodePath<t.Node>);
+    },
+    ImportDefaultSpecifier(path: NodePath<t.ImportDefaultSpecifier>) {
+      register(path.node.local.name, path as NodePath<t.Node>);
+    },
+    ImportNamespaceSpecifier(path: NodePath<t.ImportNamespaceSpecifier>) {
+      register(path.node.local.name, path as NodePath<t.Node>);
+    },
+    VariableDeclarator(path: NodePath<t.VariableDeclarator>) {
+      if (t.isIdentifier(path.node.id) && isGeneratedModuleTopLevelBindingPath(path)) {
+        register(path.node.id.name, path as NodePath<t.Node>);
+      }
+    },
+    FunctionDeclaration(path: NodePath<t.FunctionDeclaration>) {
+      if (path.node.id && isGeneratedModuleTopLevelBindingPath(path)) {
+        register(path.node.id.name, path as NodePath<t.Node>);
+      }
+    },
+    ClassDeclaration(path: NodePath<t.ClassDeclaration>) {
+      if (path.node.id && isGeneratedModuleTopLevelBindingPath(path)) {
+        register(path.node.id.name, path as NodePath<t.Node>);
+      }
+    },
+  });
+
+  return bindings;
+}
+
+function collectBindingDependencies(
+  bindingInfo: TopLevelBindingInfo,
+): Set<string> {
+  if (
+    bindingInfo.bindingPath.isImportSpecifier() ||
+    bindingInfo.bindingPath.isImportDefaultSpecifier() ||
+    bindingInfo.bindingPath.isImportNamespaceSpecifier()
+  ) {
+    return new Set();
+  }
+
+  const dependencies = new Set<string>();
+
+  bindingInfo.bindingPath.traverse({
+    Identifier(path: NodePath<t.Identifier>) {
+      if (!path.isReferencedIdentifier()) {
+        return;
+      }
+
+      const binding = path.scope.getBinding(path.node.name);
+
+      if (!binding || !isGeneratedModuleTopLevelBindingPath(binding.path)) {
+        return;
+      }
+
+      if (binding.path.node === bindingInfo.bindingPath.node) {
+        return;
+      }
+
+      dependencies.add(binding.identifier.name);
+    },
+  });
+
+  return dependencies;
+}
+
+function statementExportsBinding(
+  statement: t.Node,
+  localName: string,
+  exportName: string,
+) {
+  if (localName !== exportName || !t.isExportNamedDeclaration(statement)) {
+    return false;
+  }
+
+  if (statement.declaration) {
+    if (t.isVariableDeclaration(statement.declaration)) {
+      return statement.declaration.declarations.some(
+        (declarator) => t.isIdentifier(declarator.id, { name: localName }),
+      );
+    }
+
+    if (
+      (t.isFunctionDeclaration(statement.declaration) ||
+        t.isClassDeclaration(statement.declaration)) &&
+      statement.declaration.id
+    ) {
+      return statement.declaration.id.name === localName;
+    }
+
+    return false;
+  }
+
+  return statement.specifiers.some(
+    (specifier) =>
+      t.isExportSpecifier(specifier) &&
+      t.isIdentifier(specifier.local, { name: localName }) &&
+      t.isIdentifier(specifier.exported, { name: exportName }),
+  );
+}
+
+function generateServerModuleForFile(
+  code: string,
+  filePath: string,
+  extractedModulePath: string,
+  matches: readonly DiscoveredServerFn[],
+) {
+  const ast = parse(code, {
+    sourceType: "module",
+    plugins: ["typescript", "jsx"],
+  });
+  const bindings = collectTopLevelBindings(ast);
+  const requiredBindings = new Set<string>();
+  const queue = [...new Set(matches.map((match) => match.localName))];
+
+  while (queue.length > 0) {
+    const localName = queue.pop();
+
+    if (!localName || requiredBindings.has(localName)) {
+      continue;
+    }
+
+    requiredBindings.add(localName);
+    const bindingInfo = bindings.get(localName);
+
+    if (!bindingInfo) {
+      continue;
+    }
+
+    for (const dependency of collectBindingDependencies(bindingInfo)) {
+      if (!requiredBindings.has(dependency)) {
+        queue.push(dependency);
+      }
+    }
+  }
+
+  const keptStatements = new Set<t.Node>();
+
+  for (const bindingName of requiredBindings) {
+    const bindingInfo = bindings.get(bindingName);
+
+    if (bindingInfo) {
+      keptStatements.add(bindingInfo.statementPath.node);
+    }
+  }
+
+  const magicString = new MagicString(code);
+  traverse(ast, {
+    CallExpression(callPath: NodePath<t.CallExpression>) {
+      if (!t.isImport(callPath.node.callee)) {
+        return;
+      }
+
+      const [sourceArgument] = callPath.node.arguments;
+
+      if (!sourceArgument || sourceArgument.type === "SpreadElement" || !t.isStringLiteral(sourceArgument)) {
+        return;
+      }
+
+      const importSource = sourceArgument.value;
+
+      if (!importSource.startsWith(".")) {
+        return;
+      }
+
+      const resolvedImportPath = normalizePath(
+        path.resolve(path.dirname(filePath), importSource),
+      );
+      magicString.overwrite(
+        sourceArgument.start ?? 0,
+        sourceArgument.end ?? 0,
+        JSON.stringify(toRelativeImportPath(extractedModulePath, resolvedImportPath)),
+      );
+    },
+    ImportExpression(importExpressionPath: NodePath<t.ImportExpression>) {
+      if (!t.isStringLiteral(importExpressionPath.node.source)) {
+        return;
+      }
+
+      const importSource = importExpressionPath.node.source.value;
+
+      if (!importSource.startsWith(".")) {
+        return;
+      }
+
+      const resolvedImportPath = normalizePath(
+        path.resolve(path.dirname(filePath), importSource),
+      );
+      magicString.overwrite(
+        importExpressionPath.node.source.start ?? 0,
+        importExpressionPath.node.source.end ?? 0,
+        JSON.stringify(toRelativeImportPath(extractedModulePath, resolvedImportPath)),
+      );
+    },
+  });
+
+  for (const statement of [...ast.program.body].reverse()) {
+    if (t.isImportDeclaration(statement)) {
+      const keptSpecifiers = statement.specifiers.filter((specifier) =>
+        requiredBindings.has(specifier.local.name),
+      );
+
+      if (keptSpecifiers.length === 0) {
+        if (statement.start != null && statement.end != null) {
+          magicString.remove(statement.start, statement.end);
+        }
+        continue;
+      }
+
+      if (keptSpecifiers.length !== statement.specifiers.length) {
+        for (const specifier of statement.specifiers) {
+          if (!requiredBindings.has(specifier.local.name)) {
+            removeListNode(magicString, specifier, statement.specifiers);
+          }
+        }
+      }
+
+      const importSource = statement.source.value;
+
+      if (typeof importSource === "string" && importSource.startsWith(".")) {
+        const resolvedImportPath = normalizePath(
+          path.resolve(path.dirname(filePath), importSource),
+        );
+        magicString.overwrite(
+          statement.source.start ?? 0,
+          statement.source.end ?? 0,
+          JSON.stringify(toRelativeImportPath(extractedModulePath, resolvedImportPath)),
+        );
+      }
+
+      continue;
+    }
+
+    if (!keptStatements.has(statement)) {
+      if (statement.start != null && statement.end != null) {
+        magicString.remove(statement.start, statement.end);
+      }
+      continue;
+    }
+
+    if (t.isExportNamedDeclaration(statement) && !statement.declaration) {
+      if (statement.start != null && statement.end != null) {
+        magicString.remove(statement.start, statement.end);
+      }
+    }
+  }
+
+  const exportLines = matches
+    .filter((match) => {
+      const bindingInfo = bindings.get(match.localName);
+      return !bindingInfo || !statementExportsBinding(
+        bindingInfo.statementPath.node,
+        match.localName,
+        match.exportName,
+      );
+    })
+    .map((match) =>
+      match.localName === match.exportName
+        ? `export { ${match.localName} };`
+        : `export { ${match.localName} as ${match.exportName} };`,
+    );
+
+  const output = magicString.toString().trim();
+
+  if (exportLines.length === 0) {
+    return `${output}\n`;
+  }
+
+  return `${output}\n\n${exportLines.join("\n")}\n`;
 }
 
 function generateServerFunctionsModule(
@@ -604,11 +1007,12 @@ function generateVirtualModule(
 async function discoverProjectEntries(
   root: string,
   filter: (id: string) => boolean,
+  globs: DiscoveryGlobs,
 ) {
-  const files = await fg("**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}", {
+  const files = await fg(globs.include, {
     absolute: true,
     cwd: root,
-    ignore: DEFAULT_EXCLUDE,
+    ignore: globs.ignore,
   });
 
   const entries = new Map<string, DiscoveredServerFn[]>();
@@ -657,6 +1061,35 @@ async function writeGeneratedModule(
   return true;
 }
 
+async function writeGeneratedServerModules(
+  generatedModulePath: string,
+  discoveredByFile: ReadonlyMap<string, readonly DiscoveredServerFn[]>,
+  root: string,
+) {
+  const extractedModules = new Map<string, string>();
+
+  for (const [filePath, matches] of discoveredByFile) {
+    const extractedModulePath = getGeneratedServerModulePath(
+      generatedModulePath,
+      filePath,
+      root,
+    );
+    const source = await fs.readFile(filePath, "utf8");
+    const moduleCode = generateServerModuleForFile(
+      source,
+      filePath,
+      extractedModulePath,
+      matches,
+    );
+
+    await fs.mkdir(path.dirname(extractedModulePath), { recursive: true });
+    await fs.writeFile(extractedModulePath, moduleCode, "utf8");
+    extractedModules.set(filePath, extractedModulePath);
+  }
+
+  return extractedModules;
+}
+
 export async function generateServerFunctionsModuleFile(
   options: GenerateServerFunctionsModuleOptions,
 ) {
@@ -665,15 +1098,29 @@ export async function generateServerFunctionsModuleFile(
     options.include ?? DEFAULT_INCLUDE,
     options.exclude ?? DEFAULT_EXCLUDE,
   );
-  const discoveredByFile = await discoverProjectEntries(projectRoot, (id) => filter(id));
+  const globs = resolveDiscoveryGlobs(options.include, options.exclude);
+  const discoveredByFile = await discoverProjectEntries(
+    projectRoot,
+    (id) => filter(id),
+    globs,
+  );
   const entries = [...discoveredByFile.values()].flat().sort((left, right) =>
     left.routeKey.localeCompare(right.routeKey),
   );
   const generatedModulePath = resolveFromRoot(projectRoot, options.generatedModulePath);
   const procedureImportPath = resolveFromRoot(projectRoot, options.procedure.importPath);
+  const extractedModules = await writeGeneratedServerModules(
+    generatedModulePath,
+    discoveredByFile,
+    projectRoot,
+  );
   const moduleCode = generateServerFunctionsModule(
     entries,
-    (filePath) => toRelativeImportPath(generatedModulePath, filePath),
+    (filePath) =>
+      toRelativeImportPath(
+        generatedModulePath,
+        extractedModules.get(filePath) ?? filePath,
+      ),
     toRelativeImportPath(generatedModulePath, procedureImportPath),
     options.procedure.exportName,
     true,
@@ -703,6 +1150,7 @@ export function trpcServerFunctionsPlugin(
   options: TrpcServerFunctionsPluginOptions,
 ): Plugin {
   const filter = createFilter(options.include ?? DEFAULT_INCLUDE, options.exclude ?? DEFAULT_EXCLUDE);
+  const globs = resolveDiscoveryGlobs(options.include, options.exclude);
   const discoveredByFile = new Map<string, DiscoveredServerFn[]>();
 
   let projectRoot = normalizePath(process.cwd());
@@ -715,9 +1163,18 @@ export function trpcServerFunctionsPlugin(
       return false;
     }
 
+    const extractedModules = await writeGeneratedServerModules(
+      generatedModulePath,
+      discoveredByFile,
+      projectRoot,
+    );
     const moduleCode = generateServerFunctionsModule(
       collectEntries(),
-      (filePath) => toRelativeImportPath(generatedModulePath as string, filePath),
+      (filePath) =>
+        toRelativeImportPath(
+          generatedModulePath as string,
+          extractedModules.get(filePath) ?? filePath,
+        ),
       toRelativeImportPath(
         generatedModulePath,
         resolveFromRoot(projectRoot, options.procedure.importPath),
@@ -764,7 +1221,7 @@ export function trpcServerFunctionsPlugin(
     },
     async buildStart() {
       discoveredByFile.clear();
-      const entries = await discoverProjectEntries(projectRoot, (id) => filter(id));
+      const entries = await discoverProjectEntries(projectRoot, (id) => filter(id), globs);
 
       for (const [filePath, matches] of entries) {
         discoveredByFile.set(filePath, matches);

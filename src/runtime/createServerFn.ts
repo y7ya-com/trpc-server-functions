@@ -185,7 +185,11 @@ export function createServerFn<TInput = void, TContext = unknown>(
 export function getInternalServerFnDefinition<TInput, TOutput, TContext = unknown>(
   value: unknown,
 ) {
-  if (!value || typeof value !== "object" || !(SERVER_FUNCTION_SYMBOL in value)) {
+  if (
+    !value ||
+    (typeof value !== "object" && typeof value !== "function") ||
+    !(SERVER_FUNCTION_SYMBOL in value)
+  ) {
     return null;
   }
 
