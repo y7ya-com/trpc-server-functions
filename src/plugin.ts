@@ -1061,6 +1061,76 @@ async function writeGeneratedModule(
   return true;
 }
 
+async function cleanStaleGeneratedServerModules(
+  generatedModulePath: string,
+  discoveredByFile: ReadonlyMap<string, readonly DiscoveredServerFn[]>,
+  root: string,
+) {
+  // Safety guard: if nothing was discovered, skip cleanup to avoid wiping the
+  // entire generated directory due to a misconfigured filter or cwd issue.
+  if (discoveredByFile.size === 0) {
+    return;
+  }
+
+  const generatedModulesRoot = getGeneratedServerModulesRoot(generatedModulePath);
+
+  let existingFiles: string[];
+  try {
+    const allEntries = await fs.readdir(generatedModulesRoot, { recursive: true });
+    const candidates = (allEntries as string[]).map((entry) =>
+      normalizePath(path.join(generatedModulesRoot, entry)),
+    );
+    // Filter to only files (not directories) — use Promise.all, not .filter(async)
+    const statResults = await Promise.all(
+      candidates.map(async (filePath) => {
+        try {
+          const stat = await fs.stat(filePath);
+          return stat.isFile() ? filePath : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    existingFiles = statResults.filter((f): f is string => f !== null);
+  } catch {
+    return;
+  }
+
+  const expectedPaths = new Set<string>();
+  for (const filePath of discoveredByFile.keys()) {
+    expectedPaths.add(
+      normalizePath(getGeneratedServerModulePath(generatedModulePath, filePath, root)),
+    );
+  }
+
+  for (const filePath of existingFiles) {
+    if (!expectedPaths.has(filePath)) {
+      try {
+        await fs.rm(filePath, { force: true });
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+
+  // Remove now-empty directories (bottom-up)
+  try {
+    const dirs = (await fs.readdir(generatedModulesRoot, { recursive: true }) as string[])
+      .map((entry) => normalizePath(path.join(generatedModulesRoot, entry)))
+      .sort((a, b) => b.length - a.length); // deepest first
+
+    for (const dir of dirs) {
+      try {
+        await fs.rmdir(dir); // only succeeds if empty
+      } catch {
+        // Not empty or not a dir — skip
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+}
+
 async function writeGeneratedServerModules(
   generatedModulePath: string,
   discoveredByFile: ReadonlyMap<string, readonly DiscoveredServerFn[]>,
@@ -1109,6 +1179,7 @@ export async function generateServerFunctionsModuleFile(
   );
   const generatedModulePath = resolveFromRoot(projectRoot, options.generatedModulePath);
   const procedureImportPath = resolveFromRoot(projectRoot, options.procedure.importPath);
+  await cleanStaleGeneratedServerModules(generatedModulePath, discoveredByFile, projectRoot);
   const extractedModules = await writeGeneratedServerModules(
     generatedModulePath,
     discoveredByFile,
@@ -1227,6 +1298,12 @@ export function trpcServerFunctionsPlugin(
         discoveredByFile.set(filePath, matches);
       }
 
+      // Clean up stale generated files from previous runs before syncing.
+      // This removes generated copies of source files that have been moved or deleted.
+      if (generatedModulePath) {
+        await cleanStaleGeneratedServerModules(generatedModulePath, discoveredByFile, projectRoot);
+      }
+
       await syncGeneratedModule();
     },
     configureServer(server) {
@@ -1254,6 +1331,17 @@ export function trpcServerFunctionsPlugin(
       server.watcher.on("unlink", (filePath) => {
         const normalizedFilePath = normalizePath(filePath);
         discoveredByFile.delete(normalizedFilePath);
+
+        // Delete the generated copy of the removed source file
+        if (generatedModulePath) {
+          const generatedFilePath = getGeneratedServerModulePath(
+            generatedModulePath,
+            normalizedFilePath,
+            projectRoot,
+          );
+          void fs.rm(generatedFilePath, { force: true });
+        }
+
         void syncGeneratedModule();
         invalidateVirtualModule(server);
         server.ws.send({ type: "full-reload" });
