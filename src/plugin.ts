@@ -182,7 +182,19 @@ function getServerFnCall(
   };
 }
 
-function analyzeModule(code: string, filePath: string, root: string) {
+interface AnalyzedModule {
+  /** Server functions tied to a top-level export. Used for the manifest. */
+  discovered: DiscoveredServerFn[];
+  /**
+   * Every `.query|mutation(handler)` call site in the file (top-level AND
+   * nested), used for handler stripping on the client. Includes the entries in
+   * `discovered` plus any nested calls (e.g. inside class methods of wrapper
+   * modules).
+   */
+  allMatches: RawServerFnMatch[];
+}
+
+function analyzeModule(code: string, filePath: string, root: string): AnalyzedModule {
   const ast = parse(code, {
     sourceType: "module",
     plugins: ["typescript", "jsx"],
@@ -192,61 +204,120 @@ function analyzeModule(code: string, filePath: string, root: string) {
   const exportMap = new Map<string, string>();
   const createServerFnAliases = new Set<string>(["createServerFn"]);
 
-  const captureDeclaration = (declaration: t.VariableDeclaration) => {
-    for (const declarator of declaration.declarations) {
-      if (!t.isIdentifier(declarator.id)) {
+  // Track import renames so that wrapper modules using
+  // `import { createServerFn as createBaseServerFn } from "trpc-server-functions"`
+  // are recognized. Without this, the wrapper closure passed to
+  // `createBaseServerFn(...).query(handler)` is never stripped on the client,
+  // and the closure's references (e.g. dynamic imports of server-only modules
+  // like AsyncLocalStorage-based runtimes) leak into the client bundle.
+  for (const statement of ast.program.body) {
+    if (!t.isImportDeclaration(statement)) {
+      continue;
+    }
+
+    for (const specifier of statement.specifiers) {
+      if (!t.isImportSpecifier(specifier)) {
         continue;
       }
 
+      const importedName = t.isIdentifier(specifier.imported)
+        ? specifier.imported.name
+        : t.isStringLiteral(specifier.imported)
+          ? specifier.imported.value
+          : null;
+
+      if (importedName === "createServerFn") {
+        createServerFnAliases.add(specifier.local.name);
+      }
+    }
+  }
+
+  // First pass: also pick up top-level `const x = createServerFn` aliases
+  // before we walk the full AST for matches.
+  for (const statement of ast.program.body) {
+    const declarationNode = t.isExportNamedDeclaration(statement)
+      ? statement.declaration
+      : statement;
+
+    if (!declarationNode || !t.isVariableDeclaration(declarationNode)) {
+      continue;
+    }
+
+    for (const declarator of declarationNode.declarations) {
       if (
+        t.isIdentifier(declarator.id) &&
         declarator.init &&
         t.isTSInstantiationExpression(declarator.init) &&
         isCreateServerFnReference(declarator.init.expression, createServerFnAliases)
       ) {
         createServerFnAliases.add(declarator.id.name);
       }
+    }
+  }
 
-      const match = getServerFnCall(declarator.init, createServerFnAliases);
+  // Walk the entire AST to find every server-fn handler call site. This
+  // catches nested calls (e.g. inside class method bodies of wrapper modules
+  // like `lib/server-fn.ts`) which the previous top-level-only iteration
+  // missed entirely. Without stripping these, wrapper closures and the
+  // server-only modules they reference leak into the client bundle.
+  const allMatches: RawServerFnMatch[] = [];
+  const seenCallStarts = new Set<number>();
+
+  traverse(ast, {
+    CallExpression(callPath: NodePath<t.CallExpression>) {
+      const match = getServerFnCall(callPath.node, createServerFnAliases);
 
       if (!match) {
-        continue;
+        return;
       }
 
-      declarations.set(declarator.id.name, {
-        ...match,
-        localName: declarator.id.name,
-      });
-    }
-  };
+      if (seenCallStarts.has(match.callStart)) {
+        return;
+      }
 
+      seenCallStarts.add(match.callStart);
+      allMatches.push(match);
+    },
+  });
+
+  // Build the top-level binding map (for manifest export discovery).
   for (const statement of ast.program.body) {
-    if (t.isVariableDeclaration(statement)) {
-      captureDeclaration(statement);
-      continue;
-    }
+    const isExport = t.isExportNamedDeclaration(statement);
+    const declarationNode = isExport ? statement.declaration : statement;
 
-    if (!t.isExportNamedDeclaration(statement)) {
-      continue;
-    }
+    if (declarationNode && t.isVariableDeclaration(declarationNode)) {
+      for (const declarator of declarationNode.declarations) {
+        if (!t.isIdentifier(declarator.id)) {
+          continue;
+        }
 
-    if (statement.declaration && t.isVariableDeclaration(statement.declaration)) {
-      captureDeclaration(statement.declaration);
+        const match = getServerFnCall(declarator.init, createServerFnAliases);
 
-      for (const declarator of statement.declaration.declarations) {
-        if (t.isIdentifier(declarator.id) && !exportMap.has(declarator.id.name)) {
+        if (!match) {
+          continue;
+        }
+
+        declarations.set(declarator.id.name, {
+          ...match,
+          localName: declarator.id.name,
+        });
+
+        if (isExport && !exportMap.has(declarator.id.name)) {
           exportMap.set(declarator.id.name, declarator.id.name);
         }
       }
     }
 
-    for (const specifier of statement.specifiers) {
-      if (
-        t.isExportSpecifier(specifier) &&
-        t.isIdentifier(specifier.local) &&
-        t.isIdentifier(specifier.exported) &&
-        !exportMap.has(specifier.local.name)
-      ) {
-        exportMap.set(specifier.local.name, specifier.exported.name);
+    if (isExport) {
+      for (const specifier of statement.specifiers) {
+        if (
+          t.isExportSpecifier(specifier) &&
+          t.isIdentifier(specifier.local) &&
+          t.isIdentifier(specifier.exported) &&
+          !exportMap.has(specifier.local.name)
+        ) {
+          exportMap.set(specifier.local.name, specifier.exported.name);
+        }
       }
     }
   }
@@ -273,10 +344,10 @@ function analyzeModule(code: string, filePath: string, root: string) {
     });
   }
 
-  return discovered;
+  return { discovered, allMatches };
 }
 
-function isWithinHandler(position: number, matches: readonly DiscoveredServerFn[]) {
+function isWithinHandler(position: number, matches: readonly RawServerFnMatch[]) {
   return matches.some(
     (match) => position >= match.handlerStart && position <= match.handlerEnd,
   );
@@ -322,7 +393,7 @@ function getBindingKey(path: NodePath<t.Node>, name: string) {
 
 function collectClientPrunableBindings(
   code: string,
-  matches: readonly DiscoveredServerFn[],
+  matches: readonly RawServerFnMatch[],
 ) {
   const ast = parse(code, {
     sourceType: "module",
@@ -413,7 +484,7 @@ function removeListNode(
 function pruneClientOnlyBindings(
   magicString: MagicString,
   code: string,
-  matches: readonly DiscoveredServerFn[],
+  matches: readonly RawServerFnMatch[],
 ) {
   const bindingPaths = collectClientPrunableBindings(code, matches).sort((left, right) => {
     const leftStart = left.node.start ?? 0;
@@ -500,15 +571,23 @@ function pruneClientOnlyBindings(
   }
 }
 
-function injectMetadata(code: string, matches: readonly DiscoveredServerFn[], ssr: boolean) {
-  if (matches.length === 0) {
+function injectMetadata(
+  code: string,
+  discovered: readonly DiscoveredServerFn[],
+  allMatches: readonly RawServerFnMatch[],
+  ssr: boolean,
+) {
+  if (allMatches.length === 0) {
     return null;
   }
 
   const magicString = new MagicString(code);
   let changed = false;
 
-  for (const match of matches) {
+  // Metadata injection only makes sense for top-level exported server fns
+  // (those with manifest entries). Nested calls (e.g. inside wrapper class
+  // methods) already pass `meta` through from the caller.
+  for (const match of discovered) {
     if (!match.hasInjectedMeta) {
       const metadata = `{ id: ${JSON.stringify(match.id)}, routeKey: ${JSON.stringify(
         match.routeKey,
@@ -519,15 +598,18 @@ function injectMetadata(code: string, matches: readonly DiscoveredServerFn[], ss
       magicString.appendRight(match.handlerEnd, `, ${metadata}`);
       changed = true;
     }
+  }
 
-    if (!ssr) {
+  // Handler stripping applies to ALL call sites — top-level and nested.
+  // Stripping nested wrapper closures is what cuts the import chain to
+  // server-only modules from the client bundle.
+  if (!ssr) {
+    for (const match of allMatches) {
       magicString.overwrite(match.handlerStart, match.handlerEnd, "undefined");
       changed = true;
     }
-  }
 
-  if (!ssr) {
-    pruneClientOnlyBindings(magicString, code, matches);
+    pruneClientOnlyBindings(magicString, code, allMatches);
     changed = true;
   }
 
@@ -1025,10 +1107,10 @@ async function discoverProjectEntries(
     }
 
     const source = await fs.readFile(normalizedFilePath, "utf8");
-    const matches = analyzeModule(source, normalizedFilePath, root);
+    const { discovered } = analyzeModule(source, normalizedFilePath, root);
 
-    if (matches.length > 0) {
-      entries.set(normalizedFilePath, matches);
+    if (discovered.length > 0) {
+      entries.set(normalizedFilePath, discovered);
     }
   }
 
@@ -1266,14 +1348,14 @@ export function trpcServerFunctionsPlugin(
     }
 
     const source = await fs.readFile(normalizedFilePath, "utf8");
-    const matches = analyzeModule(source, normalizedFilePath, projectRoot);
+    const { discovered } = analyzeModule(source, normalizedFilePath, projectRoot);
 
-    if (matches.length === 0) {
+    if (discovered.length === 0) {
       discoveredByFile.delete(normalizedFilePath);
       return;
     }
 
-    discoveredByFile.set(normalizedFilePath, matches);
+    discoveredByFile.set(normalizedFilePath, discovered);
   };
 
   const collectEntries = () =>
@@ -1373,15 +1455,19 @@ export function trpcServerFunctionsPlugin(
         return null;
       }
 
-      const matches = analyzeModule(code, filePath, projectRoot);
+      const { discovered, allMatches } = analyzeModule(code, filePath, projectRoot);
 
-      if (matches.length === 0) {
+      if (allMatches.length === 0) {
         return null;
       }
 
-      discoveredByFile.set(filePath, matches);
+      if (discovered.length > 0) {
+        discoveredByFile.set(filePath, discovered);
+      } else {
+        discoveredByFile.delete(filePath);
+      }
 
-      return injectMetadata(code, matches, transformOptions?.ssr === true);
+      return injectMetadata(code, discovered, allMatches, transformOptions?.ssr === true);
     },
     async handleHotUpdate(context) {
       const filePath = normalizePath(context.file);
@@ -1391,10 +1477,10 @@ export function trpcServerFunctionsPlugin(
       }
 
       const source = await context.read();
-      const matches = analyzeModule(source, filePath, projectRoot);
+      const { discovered } = analyzeModule(source, filePath, projectRoot);
 
-      if (matches.length > 0) {
-        discoveredByFile.set(filePath, matches);
+      if (discovered.length > 0) {
+        discoveredByFile.set(filePath, discovered);
       } else {
         discoveredByFile.delete(filePath);
       }
