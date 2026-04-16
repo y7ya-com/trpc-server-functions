@@ -75,7 +75,31 @@ class ServerFnBuilder<TInput, TContext> {
       procedureType,
     };
 
+    const builderOptions = this.options;
     const callWithTransport = (input: TInput, options?: ServerFnCallOptions) => {
+      // Server-side fast path: when the original handler is attached (i.e.
+      // the module was loaded in the server bundle, not stripped by the
+      // client transform), invoke it directly instead of going through the
+      // transport. This lets a server-fn handler call another server fn
+      // locally — e.g. a route-level wrapper that delegates to a shared
+      // util — without requiring the file to have been processed by the
+      // Vite plugin on the server build, and without needing the caller
+      // to resolve a transport.
+      //
+      // On the client build the handler was overwritten to `undefined` by
+      // the plugin, so this branch never fires there and behavior is
+      // unchanged (go through the configured transport).
+      if (handler) {
+        // Mirror tRPC's `procedure.input(validator)` step so direct calls
+        // see the same parsed/validated input the transport path does.
+        // `options.input` is a user-supplied parser that returns the
+        // validated value (or throws on bad input).
+        const validator = builderOptions.input;
+        const validatedInput = typeof validator === "function"
+          ? (validator as (value: unknown) => TInput)(input)
+          : input;
+        return Promise.resolve(handler({ input: validatedInput, ctx: undefined as TContext }));
+      }
       assertTransformed(resolvedMeta);
       const transport = resolveTransport(options);
       return resolvedMeta.procedureType === "mutation"
