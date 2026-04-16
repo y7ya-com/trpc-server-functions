@@ -1,3 +1,7 @@
+import {
+  isStandardSchema,
+  resolveInputParser,
+} from "./standard-schema.js";
 import type {
   CreateServerFnOptions,
   InternalServerFnDefinition,
@@ -27,13 +31,21 @@ function resolveTransport(options?: ServerFnCallOptions): ServerFnTransport {
   );
 }
 
+function describeLocation(meta: InternalServerFnMeta) {
+  if (meta.exportName && meta.relativePath) {
+    return `${meta.exportName} (${meta.relativePath})`;
+  }
+  return meta.exportName || meta.relativePath || "<anonymous server function>";
+}
+
 function assertTransformed(meta: InternalServerFnMeta) {
   if (meta.routeKey) {
     return;
   }
 
   throw new Error(
-    "This server function is missing generated metadata. Ensure the Vite plugin transformed the module before using it.",
+    `${describeLocation(meta)} is missing generated metadata. ` +
+      `Ensure the Vite plugin transformed this module before using it, or re-run the codegen CLI.`,
   );
 }
 
@@ -76,15 +88,15 @@ class ServerFnBuilder<TInput, TContext> {
     };
 
     const builderOptions = this.options;
-    const callWithTransport = (input: TInput, options?: ServerFnCallOptions) => {
+    const parseInputIfConfigured = resolveInputParser<TInput>(builderOptions.input);
+
+    const callWithTransport = async (input: TInput, options?: ServerFnCallOptions) => {
       // Server-side fast path: when the original handler is attached (i.e.
       // the module was loaded in the server bundle, not stripped by the
       // client transform), invoke it directly instead of going through the
       // transport. This lets a server-fn handler call another server fn
       // locally — e.g. a route-level wrapper that delegates to a shared
-      // util — without requiring the file to have been processed by the
-      // Vite plugin on the server build, and without needing the caller
-      // to resolve a transport.
+      // util — without requiring a transport to be configured.
       //
       // On the client build the handler was overwritten to `undefined` by
       // the plugin, so this branch never fires there and behavior is
@@ -92,13 +104,11 @@ class ServerFnBuilder<TInput, TContext> {
       if (handler) {
         // Mirror tRPC's `procedure.input(validator)` step so direct calls
         // see the same parsed/validated input the transport path does.
-        // `options.input` is a user-supplied parser that returns the
-        // validated value (or throws on bad input).
-        const validator = builderOptions.input;
-        const validatedInput = typeof validator === "function"
-          ? (validator as (value: unknown) => TInput)(input)
+        // If no parser was supplied, pass through unchanged.
+        const validatedInput = parseInputIfConfigured
+          ? ((await parseInputIfConfigured(input)) as TInput)
           : input;
-        return Promise.resolve(handler({ input: validatedInput, ctx: undefined as TContext }));
+        return handler({ input: validatedInput, ctx: undefined as TContext });
       }
       assertTransformed(resolvedMeta);
       const transport = resolveTransport(options);
@@ -203,6 +213,20 @@ class ServerFnBuilder<TInput, TContext> {
 export function createServerFn<TInput = void, TContext = unknown>(
   options: CreateServerFnOptions<TInput> = {},
 ) {
+  // Surface a clear error when someone passes a value that looks like a
+  // parser but isn't — catches `{ input: someSchema }` where `someSchema`
+  // is misconfigured (e.g. a Zod *instance* without `.parse`, or a Valibot
+  // pipe returned incorrectly).
+  if (
+    options.input != null &&
+    !isStandardSchema(options.input) &&
+    typeof options.input !== "function"
+  ) {
+    throw new Error(
+      "createServerFn({ input }) must be a Standard Schema validator or a (value) => parsed function.",
+    );
+  }
+
   return new ServerFnBuilder<TInput, TContext>(options);
 }
 
@@ -229,7 +253,10 @@ export function withServerFnMetadata<TInput, TOutput, TContext = unknown>(
   const definition = getInternalServerFnDefinition<TInput, TOutput, TContext>(reference);
 
   if (!definition) {
-    throw new Error("Expected a server function reference while attaching generated metadata.");
+    throw new Error(
+      `Expected ${describeLocation(meta)} to be a compiled server function reference ` +
+        `when attaching generated metadata. Did the caller pass the export produced by createServerFn(...)?`,
+    );
   }
 
   Object.defineProperty(reference, SERVER_FUNCTION_SYMBOL, {

@@ -1,11 +1,34 @@
 import type { AnyProcedure, TRPCRouterRecord } from "@trpc/server";
 
+import type { AnyInputParser, StandardSchemaV1 } from "./standard-schema.js";
+
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface CreateServerFnOptions<TInput> {
-  input?: unknown;
+  /**
+   * Optional input parser. Accepts a Standard Schema validator (zod 4+,
+   * valibot 1+, arktype 2+, …) or a plain `(value: unknown) => TInput`
+   * function. If omitted, the input is passed through unchanged — which
+   * means any route wrapper that forwards `input` downstream still sees
+   * the raw value.
+   */
+  input?: AnyInputParser<TInput>;
   meta?: Record<string, unknown>;
 }
+
+/**
+ * Infer the parsed `TInput` from whatever `input` shape the user supplied.
+ * Mirrors the inference story of tRPC v11 / react-query v5: Standard Schema
+ * wins, then plain parser functions, then `void`.
+ */
+export type InferServerFnInput<TParser> = TParser extends StandardSchemaV1<
+  unknown,
+  infer Output
+>
+  ? Output
+  : TParser extends (value: unknown) => infer Output
+    ? Output
+    : void;
 
 export type ServerFnProcedureType = "query" | "mutation";
 

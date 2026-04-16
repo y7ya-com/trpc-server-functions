@@ -5,9 +5,21 @@ import path from "node:path";
 import { parse } from "@babel/parser";
 import traverseModule, { type NodePath } from "@babel/traverse";
 import * as t from "@babel/types";
+import { createFilter } from "@rollup/pluginutils";
 import fg from "fast-glob";
 import MagicString from "magic-string";
-import { createFilter, normalizePath, type Plugin, type ViteDevServer } from "vite";
+import type { Plugin, ViteDevServer } from "vite";
+
+/**
+ * Same semantics as Vite's own `normalizePath` (POSIX separators, single
+ * `./` stripping), inlined so the plugin doesn't require Vite to be loaded
+ * as a *runtime* dependency. Vite stays a type-only import, which keeps
+ * tests and the CLI from pulling the full Vite/rolldown native binding
+ * chain into the process.
+ */
+function normalizePath(input: string): string {
+  return path.posix.normalize(input.replace(/\\/g, "/"));
+}
 
 import {
   PACKAGE_NAME,
@@ -36,11 +48,6 @@ export interface GenerateServerFunctionsModuleOptions {
     exportName: string;
   };
   generatedModulePath: string;
-}
-
-interface DiscoveryGlobs {
-  include: string[];
-  ignore: string[];
 }
 
 interface TopLevelBindingInfo {
@@ -96,17 +103,40 @@ function toArray<T>(value: T | readonly T[] | undefined) {
   return Array.isArray(value) ? [...value] : [value];
 }
 
-function isGlobPattern(value: Pattern): value is string {
+/**
+ * Unified include/exclude resolution.
+ *
+ * Previously the plugin silently dropped regex patterns from fast-glob
+ * discovery while `createFilter` still honored them — leading to files
+ * that matched a regex include/exclude being missed by initial discovery
+ * but picked up in `transform()` (or vice versa). The fix: use string
+ * globs for fast-glob (widened to the defaults if the user only supplied
+ * regex patterns), then narrow the result through `createFilter` which
+ * understands both strings and regex. Filter is also used directly on
+ * every `transform()` id — so discovery and transform agree.
+ */
+interface DiscoveryContext {
+  globInclude: string[];
+  globIgnore: string[];
+  filter: (id: string) => boolean;
+}
+
+function isGlobPattern(value: unknown): value is string {
   return typeof value === "string";
 }
 
-function resolveDiscoveryGlobs(include?: Pattern, exclude?: Pattern): DiscoveryGlobs {
-  const includePatterns = toArray(include).filter(isGlobPattern);
-  const excludePatterns = toArray(exclude).filter(isGlobPattern);
+function createDiscoveryContext(
+  include: Pattern | undefined,
+  exclude: Pattern | undefined,
+): DiscoveryContext {
+  const globInclude = toArray(include).filter(isGlobPattern);
+  const globIgnore = toArray(exclude).filter(isGlobPattern);
+  const filter = createFilter(include ?? DEFAULT_INCLUDE, exclude ?? DEFAULT_EXCLUDE);
 
   return {
-    include: includePatterns.length > 0 ? includePatterns : DEFAULT_INCLUDE,
-    ignore: [...DEFAULT_EXCLUDE, ...excludePatterns],
+    globInclude: globInclude.length > 0 ? globInclude : DEFAULT_INCLUDE,
+    globIgnore: [...DEFAULT_EXCLUDE, ...globIgnore],
+    filter,
   };
 }
 
@@ -157,7 +187,7 @@ function getServerFnCall(
 
   const handlerArgument = expression.arguments[0];
 
-  if (!handlerArgument || handlerArgument.type === "SpreadElement") {
+  if (!handlerArgument || t.isSpreadElement(handlerArgument)) {
     return null;
   }
 
@@ -183,6 +213,7 @@ function getServerFnCall(
 }
 
 interface AnalyzedModule {
+  ast: t.File;
   /** Server functions tied to a top-level export. Used for the manifest. */
   discovered: DiscoveredServerFn[];
   /**
@@ -194,11 +225,15 @@ interface AnalyzedModule {
   allMatches: RawServerFnMatch[];
 }
 
-function analyzeModule(code: string, filePath: string, root: string): AnalyzedModule {
-  const ast = parse(code, {
+function parseModule(code: string): t.File {
+  return parse(code, {
     sourceType: "module",
     plugins: ["typescript", "jsx"],
   });
+}
+
+function analyzeModule(code: string, filePath: string, root: string): AnalyzedModule {
+  const ast = parseModule(code);
 
   const declarations = new Map<string, RawServerFnMatch>();
   const exportMap = new Map<string, string>();
@@ -232,8 +267,12 @@ function analyzeModule(code: string, filePath: string, root: string): AnalyzedMo
     }
   }
 
-  // First pass: also pick up top-level `const x = createServerFn` aliases
-  // before we walk the full AST for matches.
+  // First pass: pick up top-level `const x = createServerFn` aliases
+  // before we walk the full AST for matches. Handles BOTH the plain
+  // identifier alias (`const make = createServerFn`) and the generic
+  // instantiation alias (`const make = createServerFn<Foo>`) — previously
+  // only the latter was detected, so non-generic wrapper aliases silently
+  // failed to strip their handlers from the client bundle.
   for (const statement of ast.program.body) {
     const declarationNode = t.isExportNamedDeclaration(statement)
       ? statement.declaration
@@ -244,11 +283,18 @@ function analyzeModule(code: string, filePath: string, root: string): AnalyzedMo
     }
 
     for (const declarator of declarationNode.declarations) {
+      if (!t.isIdentifier(declarator.id) || !declarator.init) {
+        continue;
+      }
+
+      const initNode = declarator.init;
+      const initExpression = t.isTSInstantiationExpression(initNode)
+        ? initNode.expression
+        : initNode;
+
       if (
-        t.isIdentifier(declarator.id) &&
-        declarator.init &&
-        t.isTSInstantiationExpression(declarator.init) &&
-        isCreateServerFnReference(declarator.init.expression, createServerFnAliases)
+        t.isExpression(initExpression) &&
+        isCreateServerFnReference(initExpression, createServerFnAliases)
       ) {
         createServerFnAliases.add(declarator.id.name);
       }
@@ -344,7 +390,7 @@ function analyzeModule(code: string, filePath: string, root: string): AnalyzedMo
     });
   }
 
-  return { discovered, allMatches };
+  return { ast, discovered, allMatches };
 }
 
 function isWithinHandler(position: number, matches: readonly RawServerFnMatch[]) {
@@ -353,6 +399,15 @@ function isWithinHandler(position: number, matches: readonly RawServerFnMatch[])
   );
 }
 
+/**
+ * Is this path a top-level binding that's eligible for client-side pruning?
+ *
+ * We never prune exports — a consumer might still reference them — so the
+ * `export const foo = ...` form is filtered out here. Plain top-level
+ * `const`/`let`/function/class declarations (and import specifiers) are
+ * candidates. Anything nested inside a block, function, or class method is
+ * out of scope.
+ */
 function isTopLevelBindingPath(path: NodePath<t.Node>) {
   if (
     path.isImportSpecifier() ||
@@ -366,18 +421,18 @@ function isTopLevelBindingPath(path: NodePath<t.Node>) {
     const declarationPath = path.parentPath;
     const containerPath = declarationPath.parentPath;
 
+    // Must be: Program > VariableDeclaration > VariableDeclarator.
+    // Exclude `export const x = ...` — those stay as public exports.
     return (
       declarationPath.isVariableDeclaration() &&
       containerPath != null &&
-      (containerPath.isProgram() || containerPath.isExportNamedDeclaration()) &&
-      !containerPath.isExportNamedDeclaration()
+      containerPath.isProgram()
     );
   }
 
   if (path.isFunctionDeclaration() || path.isClassDeclaration()) {
-    const containerPath = path.parentPath;
-
-    return containerPath?.isProgram() === true;
+    // Same here: direct child of Program, not of ExportNamedDeclaration.
+    return path.parentPath?.isProgram() === true;
   }
 
   return false;
@@ -392,14 +447,9 @@ function getBindingKey(path: NodePath<t.Node>, name: string) {
 }
 
 function collectClientPrunableBindings(
-  code: string,
+  ast: t.File,
   matches: readonly RawServerFnMatch[],
 ) {
-  const ast = parse(code, {
-    sourceType: "module",
-    plugins: ["typescript", "jsx"],
-  });
-
   const usage = new Map<
     string,
     {
@@ -483,10 +533,10 @@ function removeListNode(
 
 function pruneClientOnlyBindings(
   magicString: MagicString,
-  code: string,
+  ast: t.File,
   matches: readonly RawServerFnMatch[],
 ) {
-  const bindingPaths = collectClientPrunableBindings(code, matches).sort((left, right) => {
+  const bindingPaths = collectClientPrunableBindings(ast, matches).sort((left, right) => {
     const leftStart = left.node.start ?? 0;
     const rightStart = right.node.start ?? 0;
     return rightStart - leftStart;
@@ -573,6 +623,7 @@ function pruneClientOnlyBindings(
 
 function injectMetadata(
   code: string,
+  ast: t.File,
   discovered: readonly DiscoveredServerFn[],
   allMatches: readonly RawServerFnMatch[],
   ssr: boolean,
@@ -609,7 +660,7 @@ function injectMetadata(
       changed = true;
     }
 
-    pruneClientOnlyBindings(magicString, code, allMatches);
+    pruneClientOnlyBindings(magicString, ast, allMatches);
     changed = true;
   }
 
@@ -847,10 +898,7 @@ function generateServerModuleForFile(
   extractedModulePath: string,
   matches: readonly DiscoveredServerFn[],
 ) {
-  const ast = parse(code, {
-    sourceType: "module",
-    plugins: ["typescript", "jsx"],
-  });
+  const ast = parseModule(code);
   const bindings = collectTopLevelBindings(ast);
   const requiredBindings = new Set<string>();
   const queue = [...new Set(matches.map((match) => match.localName))];
@@ -1088,13 +1136,12 @@ function generateVirtualModule(
 
 async function discoverProjectEntries(
   root: string,
-  filter: (id: string) => boolean,
-  globs: DiscoveryGlobs,
+  discovery: DiscoveryContext,
 ) {
-  const files = await fg(globs.include, {
+  const files = await fg(discovery.globInclude, {
     absolute: true,
     cwd: root,
-    ignore: globs.ignore,
+    ignore: discovery.globIgnore,
   });
 
   const entries = new Map<string, DiscoveredServerFn[]>();
@@ -1102,7 +1149,10 @@ async function discoverProjectEntries(
   for (const filePath of files) {
     const normalizedFilePath = normalizePath(filePath);
 
-    if (!filter(normalizedFilePath)) {
+    // Narrow via createFilter so that regex include/exclude are honored
+    // consistently with the transform-time filter. Without this, regex
+    // patterns accepted by createFilter would be invisible at discovery.
+    if (!discovery.filter(normalizedFilePath)) {
       continue;
     }
 
@@ -1246,16 +1296,8 @@ export async function generateServerFunctionsModuleFile(
   options: GenerateServerFunctionsModuleOptions,
 ) {
   const projectRoot = normalizePath(path.resolve(options.root ?? process.cwd()));
-  const filter = createFilter(
-    options.include ?? DEFAULT_INCLUDE,
-    options.exclude ?? DEFAULT_EXCLUDE,
-  );
-  const globs = resolveDiscoveryGlobs(options.include, options.exclude);
-  const discoveredByFile = await discoverProjectEntries(
-    projectRoot,
-    (id) => filter(id),
-    globs,
-  );
+  const discovery = createDiscoveryContext(options.include, options.exclude);
+  const discoveredByFile = await discoverProjectEntries(projectRoot, discovery);
   const entries = [...discoveredByFile.values()].flat().sort((left, right) =>
     left.routeKey.localeCompare(right.routeKey),
   );
@@ -1299,17 +1341,43 @@ function invalidateVirtualModule(server: ViteDevServer) {
   return module;
 }
 
+/**
+ * Serialize async work behind a chained promise.
+ *
+ * Multiple rapid file edits (e.g. an editor "format on save" that touches
+ * several files at once) were previously able to race inside
+ * `syncGeneratedModule` because the watcher handlers fired their async work
+ * without awaiting each other. Two interleaving calls could rewrite the
+ * generated registry mid-write, producing a truncated or mixed file. This
+ * queue funnels every sync through a single tail-chained promise.
+ */
+function createSerialQueue() {
+  let tail: Promise<unknown> = Promise.resolve();
+
+  return {
+    run<T>(task: () => Promise<T>): Promise<T> {
+      const next = tail.then(task, task);
+      tail = next.catch(() => {
+        // Swallow for the purposes of chaining; the caller gets the rejection
+        // via their own awaited promise.
+      });
+      return next;
+    },
+  };
+}
+
 export function trpcServerFunctionsPlugin(
   options: TrpcServerFunctionsPluginOptions,
 ): Plugin {
-  const filter = createFilter(options.include ?? DEFAULT_INCLUDE, options.exclude ?? DEFAULT_EXCLUDE);
-  const globs = resolveDiscoveryGlobs(options.include, options.exclude);
+  const discovery = createDiscoveryContext(options.include, options.exclude);
   const discoveredByFile = new Map<string, DiscoveredServerFn[]>();
 
   let projectRoot = normalizePath(process.cwd());
   let generatedModulePath = options.generatedModulePath
     ? resolveFromRoot(process.cwd(), options.generatedModulePath)
     : null;
+
+  const queue = createSerialQueue();
 
   const syncGeneratedModule = async () => {
     if (!generatedModulePath) {
@@ -1342,12 +1410,23 @@ export function trpcServerFunctionsPlugin(
   const refreshFile = async (filePath: string) => {
     const normalizedFilePath = normalizePath(filePath);
 
-    if (!filter(normalizedFilePath)) {
+    if (!discovery.filter(normalizedFilePath)) {
       discoveredByFile.delete(normalizedFilePath);
       return;
     }
 
-    const source = await fs.readFile(normalizedFilePath, "utf8");
+    let source: string;
+    try {
+      source = await fs.readFile(normalizedFilePath, "utf8");
+    } catch (error) {
+      const fsError = error as NodeJS.ErrnoException;
+      if (fsError.code === "ENOENT") {
+        discoveredByFile.delete(normalizedFilePath);
+        return;
+      }
+      throw error;
+    }
+
     const { discovered } = analyzeModule(source, normalizedFilePath, projectRoot);
 
     if (discovered.length === 0) {
@@ -1373,60 +1452,66 @@ export function trpcServerFunctionsPlugin(
         : null;
     },
     async buildStart() {
-      discoveredByFile.clear();
-      const entries = await discoverProjectEntries(projectRoot, (id) => filter(id), globs);
+      await queue.run(async () => {
+        discoveredByFile.clear();
+        const entries = await discoverProjectEntries(projectRoot, discovery);
 
-      for (const [filePath, matches] of entries) {
-        discoveredByFile.set(filePath, matches);
-      }
-
-      // Clean up stale generated files from previous runs before syncing.
-      // This removes generated copies of source files that have been moved or deleted.
-      if (generatedModulePath) {
-        await cleanStaleGeneratedServerModules(generatedModulePath, discoveredByFile, projectRoot);
-      }
-
-      await syncGeneratedModule();
-    },
-    configureServer(server) {
-      const syncFile = async (filePath: string) => {
-        const normalizedFilePath = normalizePath(filePath);
-
-        if (!filter(normalizedFilePath)) {
-          return;
+        for (const [filePath, matches] of entries) {
+          discoveredByFile.set(filePath, matches);
         }
 
-        await refreshFile(normalizedFilePath);
+        // Clean up stale generated files from previous runs before syncing.
+        // This removes generated copies of source files that have been moved
+        // or deleted between runs.
+        if (generatedModulePath) {
+          await cleanStaleGeneratedServerModules(
+            generatedModulePath,
+            discoveredByFile,
+            projectRoot,
+          );
+        }
+
         await syncGeneratedModule();
-        invalidateVirtualModule(server);
-      };
-
-      server.watcher.on("add", async (filePath) => {
-        await syncFile(filePath);
-        server.ws.send({ type: "full-reload" });
       });
-
-      server.watcher.on("change", async (filePath) => {
-        await syncFile(filePath);
+    },
+    configureServer(server) {
+      // Watcher scope is intentionally narrow:
+      //   - `add` / `unlink` are not covered by Vite's `handleHotUpdate`, so
+      //     they must be handled here.
+      //   - `change` is handled EXCLUSIVELY by `handleHotUpdate` below so we
+      //     don't double-sync on every edit (previously both fired, which
+      //     duplicated the expensive re-parse + rewrite).
+      server.watcher.on("add", (filePath) => {
+        void queue.run(async () => {
+          await refreshFile(filePath);
+          await syncGeneratedModule();
+          invalidateVirtualModule(server);
+          server.ws.send({ type: "full-reload" });
+        });
       });
 
       server.watcher.on("unlink", (filePath) => {
-        const normalizedFilePath = normalizePath(filePath);
-        discoveredByFile.delete(normalizedFilePath);
+        void queue.run(async () => {
+          const normalizedFilePath = normalizePath(filePath);
+          discoveredByFile.delete(normalizedFilePath);
 
-        // Delete the generated copy of the removed source file
-        if (generatedModulePath) {
-          const generatedFilePath = getGeneratedServerModulePath(
-            generatedModulePath,
-            normalizedFilePath,
-            projectRoot,
-          );
-          void fs.rm(generatedFilePath, { force: true });
-        }
+          if (generatedModulePath) {
+            const generatedFilePath = getGeneratedServerModulePath(
+              generatedModulePath,
+              normalizedFilePath,
+              projectRoot,
+            );
+            try {
+              await fs.rm(generatedFilePath, { force: true });
+            } catch {
+              // Non-fatal: the generated file may already be gone.
+            }
+          }
 
-        void syncGeneratedModule();
-        invalidateVirtualModule(server);
-        server.ws.send({ type: "full-reload" });
+          await syncGeneratedModule();
+          invalidateVirtualModule(server);
+          server.ws.send({ type: "full-reload" });
+        });
       });
     },
     resolveId(id) {
@@ -1447,7 +1532,7 @@ export function trpcServerFunctionsPlugin(
       const filePath = normalizePath(id.split("?", 1)[0] ?? id);
 
       if (
-        !filter(filePath) ||
+        !discovery.filter(filePath) ||
         !code.includes("createServerFn") ||
         (!code.includes(".query(") &&
           !code.includes(".mutation("))
@@ -1455,37 +1540,45 @@ export function trpcServerFunctionsPlugin(
         return null;
       }
 
-      const { discovered, allMatches } = analyzeModule(code, filePath, projectRoot);
+      const analysis = analyzeModule(code, filePath, projectRoot);
 
-      if (allMatches.length === 0) {
+      if (analysis.allMatches.length === 0) {
         return null;
       }
 
-      if (discovered.length > 0) {
-        discoveredByFile.set(filePath, discovered);
+      if (analysis.discovered.length > 0) {
+        discoveredByFile.set(filePath, analysis.discovered);
       } else {
         discoveredByFile.delete(filePath);
       }
 
-      return injectMetadata(code, discovered, allMatches, transformOptions?.ssr === true);
+      return injectMetadata(
+        code,
+        analysis.ast,
+        analysis.discovered,
+        analysis.allMatches,
+        transformOptions?.ssr === true,
+      );
     },
     async handleHotUpdate(context) {
       const filePath = normalizePath(context.file);
 
-      if (!filter(filePath)) {
+      if (!discovery.filter(filePath)) {
         return;
       }
 
-      const source = await context.read();
-      const { discovered } = analyzeModule(source, filePath, projectRoot);
+      await queue.run(async () => {
+        const source = await context.read();
+        const { discovered } = analyzeModule(source, filePath, projectRoot);
 
-      if (discovered.length > 0) {
-        discoveredByFile.set(filePath, discovered);
-      } else {
-        discoveredByFile.delete(filePath);
-      }
+        if (discovered.length > 0) {
+          discoveredByFile.set(filePath, discovered);
+        } else {
+          discoveredByFile.delete(filePath);
+        }
 
-      await syncGeneratedModule();
+        await syncGeneratedModule();
+      });
 
       const virtualModule = invalidateVirtualModule(context.server);
 
@@ -1497,3 +1590,15 @@ export function trpcServerFunctionsPlugin(
     },
   };
 }
+
+/**
+ * Internal entry points exported exclusively for tests. Not part of the
+ * stable public API — don't import from here in user code.
+ */
+export const __internal = {
+  analyzeModule,
+  createDiscoveryContext,
+  injectMetadata,
+  generateServerModuleForFile,
+  generateServerFunctionsModule,
+};

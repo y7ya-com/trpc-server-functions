@@ -24,8 +24,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test \"src/__tests__/**/*.test.ts\"",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build && npm run check"
+    "prepublishOnly": "npm run build && npm run check && npm test"
   },
   "keywords": [
     "trpc",
@@ -58,12 +59,14 @@
     "@babel/parser": "^7.28.4",
     "@babel/traverse": "^7.28.4",
     "@babel/types": "^7.28.4",
+    "@rollup/pluginutils": "^5.1.4",
     "fast-glob": "^3.3.3",
     "magic-string": "^0.30.21"
   },
   "devDependencies": {
     "@types/babel__traverse": "^7.28.0",
     "@types/node": "^24.5.2",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^8.0.0"
   }

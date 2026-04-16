@@ -4,11 +4,17 @@ export {
   createTRPCClientTransport,
   createTRPCProcedureRecord,
   getInternalServerFnDefinition,
+  isStandardSchema,
+  resolveInputParser,
   setServerFnTransport,
+  StandardSchemaValidationError,
   withServerFnMetadata,
 } from "./runtime/index.js";
 export type {
+  AnyInputParser,
   CreateServerFnOptions,
+  InferServerFnInput,
+  InputParserFunction,
   InternalServerFnMeta,
   MutationServerFn,
   ProcedureBuilderLike,
@@ -23,5 +29,10 @@ export type {
   ServerFnQueryOptions,
   ServerFnReferenceEntry,
   ServerFnTransport,
+  StandardSchemaFailureResult,
+  StandardSchemaIssue,
+  StandardSchemaResult,
+  StandardSchemaSuccessResult,
+  StandardSchemaV1,
   TRPCProcedureRecord,
 } from "./runtime/index.js";
